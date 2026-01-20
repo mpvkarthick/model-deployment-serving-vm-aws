@@ -60,7 +60,7 @@ apt install -y git python3 python3-pip nginx python3-venv
 # ============================================================================
 # Clone the Intent Classifier application repository into the app directory
 
-git clone git@github.com:mpvkarthick/model-deployment-serving-vm-aws.git .
+git clone https://github.com/mpvkarthick/model-deployment-serving-vm-aws.git .
 
 # ============================================================================
 # SECTION 4: PYTHON VIRTUAL ENVIRONMENT AND DEPENDENCIES
