@@ -1,23 +1,66 @@
+################################################################################
+# AWS CloudFormation Template: Intent Classifier Application Infrastructure
+################################################################################
+#
+# PURPOSE:
+#   This CloudFormation template automates the deployment of the Intent Classifier
+#   ML model service on AWS. It provisions a fully configured EC2 instance within
+#   an existing VPC/Subnet, with automatic application setup via user data script.
+#
+# ARCHITECTURE:
+#   - EC2 Instance: Hosts the Intent Classifier application
+#   - Security Group: Manages ingress/egress traffic (SSH + HTTP)
+#   - IAM Role: Provides instance permissions (SSM Session Manager access)
+#   - User Data: Automatically configures Gunicorn + Nginx on instance launch
+#
+# DEPLOYMENT:
+#   aws cloudformation create-stack \
+#     --stack-name intent-hw-app-stack \
+#     --template-body file://intent-hw-app.yaml \
+#     --parameters \
+#       ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxx \
+#       ParameterKey=SubnetId,ParameterValue=subnet-xxxxxxxx \
+#       ParameterKey=KeyName,ParameterValue=your-keypair-name \
+#       ParameterKey=MyIpCidr,ParameterValue=your-ip/32 \
+#     --capabilities CAPABILITY_NAMED_IAM
+#
+# CLEANUP:
+#   aws cloudformation delete-stack --stack-name intent-hw-app-stack
+#
+################################################################################
+
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Intent Classifier - EC2 in existing VPC/Subnet + new Security Group"
+Description: "Intent Classifier ML Model - Complete EC2 infrastructure with Gunicorn/Nginx"
 
 Parameters:
+  # ============================================================================
+  # NETWORKING PARAMETERS - Must reference existing AWS resources
+  # ============================================================================
+
   VpcId:
     Type: AWS::EC2::VPC::Id
-    Description: "Existing VPC ID (vpc-...)"
+    Description: "Existing VPC ID (vpc-...) where EC2 instance will be launched"
 
   SubnetId:
     Type: AWS::EC2::Subnet::Id
-    Description: "Existing subnet ID (subnet-...) to launch EC2 into"
+    Description: "Existing subnet ID (subnet-...) within the VPC for EC2 placement"
+
+  # ============================================================================
+  # SECURITY PARAMETERS
+  # ============================================================================
 
   KeyName:
     Type: AWS::EC2::KeyPair::KeyName
-    Description: "Your existing EC2 key pair name"
+    Description: "Your existing EC2 key pair name for SSH access"
 
   MyIpCidr:
     Type: String
     Default: "0.0.0.0/0"
-    Description: "Your public IP in CIDR for SSH (recommended: x.x.x.x/32)"
+    Description: "Your public IP in CIDR notation for SSH access (e.g., 192.0.2.1/32). WARNING: 0.0.0.0/0 allows SSH from anywhere"
+
+  # ============================================================================
+  # INSTANCE CONFIGURATION PARAMETERS
+  # ============================================================================
 
   InstanceType:
     Type: String
@@ -26,30 +69,52 @@ Parameters:
       - t3.micro
       - t3.small
       - t3.medium
-    Description: "EC2 instance type"
+    Description: "EC2 instance type. t3.small recommended for ML inference workloads"
 
   UbuntuAmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
-    Description: "Ubuntu 22.04 LTS AMI (from SSM Parameter Store)"
+    Description: "Ubuntu 22.04 LTS AMI (automatically fetched from AWS Systems Manager Parameter Store)"
 
 Resources:
+  # ============================================================================
+  # SECURITY GROUP RESOURCE
+  # ============================================================================
+  # Controls inbound and outbound traffic for the EC2 instance
+
   AppSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: "Intent app SG: allow SSH + HTTP"
+      GroupDescription: "Intent Classifier security group: SSH + HTTP ingress"
       VpcId: !Ref VpcId
       SecurityGroupIngress:
-        # SSH from your IP only (recommended)
+        # ====================================================================
+        # SSH ACCESS - Restricted to specified IP (security best practice)
+        # ====================================================================
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
           CidrIp: !Ref MyIpCidr
-        # HTTP for the web app
+          Description: "SSH access from specified IP"
+
+        # ====================================================================
+        # HTTP ACCESS - Open to world for public web service
+        # ====================================================================
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
+          Description: "HTTP traffic for Intent Classifier API"
+
+      Tags:
+        - Key: Name
+          Value: intent-classifier-sg
+
+  # ============================================================================
+  # IAM ROLE RESOURCE
+  # ============================================================================
+  # Provides EC2 instance with AWS permissions for SSM Session Manager and
+  # other AWS API operations
 
   AppInstanceRole:
     Type: AWS::IAM::Role
@@ -62,14 +127,32 @@ Resources:
               Service: ec2.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        # Lets you connect via SSM Session Manager (no SSH needed if you prefer)
+        # ====================================================================
+        # Enables AWS Systems Manager Session Manager for secure shell access
+        # Alternative to SSH; no need to manage security groups for SSH
+        # ====================================================================
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: intent-classifier-instance-role
+
+  # ============================================================================
+  # IAM INSTANCE PROFILE RESOURCE
+  # ============================================================================
+  # Attaches the IAM role to EC2 instance for permission assignment
 
   AppInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
       Roles:
         - !Ref AppInstanceRole
+
+  # ============================================================================
+  # EC2 INSTANCE RESOURCE - MAIN APPLICATION SERVER
+  # ============================================================================
+  # Provisions Ubuntu EC2 instance with automatic Gunicorn + Nginx setup
+  # via embedded user data script. This is the core compute resource running
+  # the Intent Classifier ML model and serving predictions via HTTP API.
 
   AppInstance:
     Type: AWS::EC2::Instance
@@ -85,6 +168,14 @@ Resources:
         - Key: Name
           Value: intent-classifier-ec2
       UserData:
+        # ====================================================================
+        # USER DATA SCRIPT - Automatic Instance Initialization
+        # ====================================================================
+        # This bash script runs automatically on first instance boot
+        # Performs all setup: package installation, git clone, Python venv,
+        # model training, Gunicorn/Nginx configuration, and service startup
+        # See userdata.sh in repository for detailed documentation
+        # ====================================================================
         Fn::Base64: !Sub |
           #!/bin/bash
           set -e
@@ -149,14 +240,51 @@ Resources:
           systemctl enable nginx
           systemctl restart nginx
 
+# ============================================================================
+# CLOUDFORMATION OUTPUTS
+# ============================================================================
+# Return important instance details for accessing and monitoring the deployment
+
 Outputs:
   InstanceId:
+    Description: "EC2 Instance ID (use for AWS Console or CLI)"
     Value: !Ref AppInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceId"
 
   PublicIp:
-    Description: "Public IP of the EC2 instance"
+    Description: "Public IP address of the EC2 instance for HTTP access"
     Value: !GetAtt AppInstance.PublicIp
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicIp"
 
   AppURL:
-    Description: "URL (after your nginx config points to your app)"
-    Value: !Sub "http://${AppInstance.PublicDnsName}/"
+    Description: "Application URL for accessing Intent Classifier API"
+    Value: !Sub "http://${AppInstance.PublicDnsName}/predict"
+    Export:
+      Name: !Sub "${AWS::StackName}-AppURL"
+
+  SecurityGroupId:
+    Description: "Security Group ID for reference or modification"
+    Value: !Ref AppSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroupId"
+
+################################################################################
+# END OF CLOUDFORMATION TEMPLATE
+################################################################################
+#
+# NEXT STEPS:
+#   1. Wait for stack creation to complete: ~10-15 minutes
+#   2. Get outputs: aws cloudformation describe-stacks --stack-name intent-hw-app-stack --query 'Stacks[0].Outputs'
+#   3. Test application: curl http://<PublicIp>/predict
+#   4. SSH into instance: ssh -i your-key.pem ubuntu@<PublicIp>
+#   5. Check logs: sudo journalctl -u intent_gunicorn -f
+#
+# TROUBLESHOOTING:
+#   - Stack creation fails: Check CloudFormation Events tab for details
+#   - Instance doesn't boot: Verify VPC/Subnet IDs and key pair exists
+#   - App not responding: SSH in and check 'systemctl status intent_gunicorn'
+#   - SSH access denied: Verify MyIpCidr parameter matches your public IP
+#
+################################################################################

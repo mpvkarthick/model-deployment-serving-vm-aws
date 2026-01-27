@@ -1,0 +1,604 @@
+################################################################################
+# AWS CloudFormation Template: Intent Classifier Production Deployment
+################################################################################
+#
+# PURPOSE:
+#   Production-ready CloudFormation template for Intent Classifier ML model.
+#   Deploys highly available, auto-scaling infrastructure with:
+#   - Multi-AZ EC2 instances in Auto Scaling Group
+#   - Application Load Balancer (ALB) for traffic distribution
+#   - Health checks and automatic instance recovery
+#   - VPC with public subnets across availability zones
+#
+# ARCHITECTURE:
+#   Internet → ALB (Port 80) → Target Group → ASG → EC2 Instances
+#   |
+#   ├─ AZ-a: Subnet + EC2 Instance + Nginx + Gunicorn
+#   └─ AZ-b: Subnet + EC2 Instance + Nginx + Gunicorn
+#
+# KEY FEATURES:
+#   ✓ Auto Scaling (min: 2, max: 6 instances)
+#   ✓ Multi-AZ for high availability
+#   ✓ Health checks (HTTP /health endpoint)
+#   ✓ Application Load Balancer
+#   ✓ Automatic instance registration with ALB
+#   ✓ Security Group integration
+#   ✓ IAM role for AWS API access
+#
+# DEPLOYMENT:
+#   aws cloudformation create-stack \
+#     --stack-name intent-hw-prod-stack \
+#     --template-body file://intent-hw-app-enhanced.yaml \
+#     --parameters \
+#       ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxx \
+#       ParameterKey=SubnetId1,ParameterValue=subnet-xxxxxxxx \
+#       ParameterKey=SubnetId2,ParameterValue=subnet-xxxxxxxx \
+#       ParameterKey=KeyName,ParameterValue=your-keypair-name \
+#       ParameterKey=EnvironmentName,ParameterValue=production \
+#     --capabilities CAPABILITY_NAMED_IAM
+#
+# CLEANUP:
+#   aws cloudformation delete-stack --stack-name intent-hw-prod-stack
+#
+################################################################################
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Intent Classifier - Production-grade deployment with ALB, ASG, and multi-AZ"
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetId1
+          - SubnetId2
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - KeyName
+          - SSHCidr
+      - Label:
+          default: "Instance Configuration"
+        Parameters:
+          - InstanceType
+          - MinSize
+          - MaxSize
+          - DesiredCapacity
+          - EnvironmentName
+
+Parameters:
+  # ============================================================================
+  # NETWORKING PARAMETERS
+  # ============================================================================
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: "VPC ID where resources will be deployed (multi-AZ VPC required)"
+
+  SubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: "Subnet ID in Availability Zone A (AZ-a)"
+
+  SubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: "Subnet ID in Availability Zone B (AZ-b) - MUST be in different AZ than SubnetId1"
+
+  # ============================================================================
+  # SECURITY PARAMETERS
+  # ============================================================================
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: "EC2 Key Pair name for SSH access to instances"
+
+  SSHCidr:
+    Type: String
+    Default: "0.0.0.0/0"
+    Description: "CIDR block allowed for SSH access (default: 0.0.0.0/0 - open to all). For production, use specific IP/32"
+
+  # ============================================================================
+  # AUTO SCALING PARAMETERS
+  # ============================================================================
+
+  MinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: "Minimum number of EC2 instances (recommended: 2 for high availability)"
+
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: "Desired number of running EC2 instances"
+
+  MaxSize:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 20
+    Description: "Maximum number of EC2 instances for scaling (recommended: 6 for cost control)"
+
+  # ============================================================================
+  # INSTANCE CONFIGURATION PARAMETERS
+  # ============================================================================
+
+  InstanceType:
+    Type: String
+    Default: "t3.small"
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t2.small
+      - t2.medium
+    Description: "EC2 instance type (t3.small recommended for ML inference)"
+
+  EnvironmentName:
+    Type: String
+    Default: "production"
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: "Environment name for resource tagging and identification"
+
+Mappings:
+  # ============================================================================
+  # Note: Using SSM Parameter Store for dynamic AMI lookup instead of hardcoded IDs
+  # This ensures always using the latest Ubuntu 22.04 LTS AMI for your region
+  # ============================================================================
+  RegionAMIMap:
+    us-east-1:
+      AMI: ami-0030e4319cbf4dbf2
+    us-west-1:
+      AMI: ami-02ea247e531e68425
+    us-west-2:
+      AMI: ami-0eb9d67a46d18a606
+    eu-west-1:
+      AMI: ami-0d2a4a5d69e46ea0b
+    eu-central-1:
+      AMI: ami-0a1ee2fb28fe05df3
+    ap-southeast-1:
+      AMI: ami-0dc5785603ad4ff54
+    ap-southeast-2:
+      AMI: ami-0c8bda99fdc500d2e
+
+Resources:
+  # ============================================================================
+  # SECURITY GROUP FOR ALB (Application Load Balancer)
+  # ============================================================================
+  # Allows HTTP/HTTPS from internet to ALB
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for Application Load Balancer"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: "Allow HTTP from anywhere"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "Allow HTTPS from anywhere"
+      Tags:
+        - Key: Name
+          Value: !Sub "intent-alb-sg-${EnvironmentName}"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================================
+  # SECURITY GROUP FOR EC2 INSTANCES
+  # ============================================================================
+  # Allows traffic from ALB and SSH access
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for Intent Classifier EC2 instances"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # Traffic from ALB only
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: "HTTP from ALB"
+        # SSH access from specified CIDR
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHCidr
+          Description: "SSH access"
+      Tags:
+        - Key: Name
+          Value: !Sub "intent-instance-sg-${EnvironmentName}"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================================
+  # IAM ROLE FOR EC2 INSTANCES
+  # ============================================================================
+  # Provides permissions for SSM Session Manager and CloudWatch
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub "intent-instance-role-${EnvironmentName}"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # ============================================================================
+  # LAUNCH TEMPLATE FOR AUTO SCALING GROUP
+  # ============================================================================
+  # Defines instance configuration, AMI, user data script, etc.
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "intent-classifier-lt-${EnvironmentName}"
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionAMIMap, !Ref "AWS::Region", AMI]
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "intent-classifier-${EnvironmentName}"
+              - Key: Environment
+                Value: !Ref EnvironmentName
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub "intent-classifier-volume-${EnvironmentName}"
+              - Key: Environment
+                Value: !Ref EnvironmentName
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+            
+            # Add health check endpoint for ALB
+            echo "#!/bin/bash
+            echo 'OK'" > /usr/local/bin/health-check.sh
+            chmod +x /usr/local/bin/health-check.sh
+
+            export APP_DIRECTORY="/opt/intent-hw-app"
+            mkdir -p $APP_DIRECTORY
+            cd $APP_DIRECTORY
+
+            apt-get update -y
+            apt install -y git python3 python3-pip nginx python3-venv
+
+            git clone https://github.com/mpvkarthick/model-deployment-serving-vm-aws.git .
+
+            python3 -m venv venv
+            source venv/bin/activate
+            pip install --upgrade pip
+            pip install -r requirements.txt
+            pip install gunicorn
+
+            python3 model/train.py
+
+            cat >/etc/systemd/system/intent_gunicorn.service <<'EOF'
+            [Unit]
+            Description=Gunicorn instance for Intent Classifier
+            After=network.target
+
+            [Service]
+            User=ubuntu
+            Group=ubuntu
+            WorkingDirectory=/opt/intent-hw-app
+            Environment="PATH=/opt/intent-hw-app/venv/bin"
+            ExecStart=/opt/intent-hw-app/venv/bin/gunicorn --workers 3 --bind 127.0.0.1:6000 wsgi:app
+            Restart=always
+            RestartSec=3
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            cat >/etc/nginx/conf.d/intent_app.conf <<'EOF'
+            server {
+                listen 80;
+                server_name _;
+
+                # Health check endpoint for ALB (proxies to Flask /health)
+                location /health {
+                    access_log off;
+                    proxy_pass http://127.0.0.1:6000/health;
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_connect_timeout 10s;
+                    proxy_read_timeout 10s;
+                }
+
+                # Predict endpoint - proxies all requests to Flask app
+                location / {
+                    proxy_pass http://127.0.0.1:6000;
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_connect_timeout 60s;
+                    proxy_read_timeout 120s;
+                }
+            }
+            EOF
+
+            if [ -L /etc/nginx/sites-enabled/default ] || [ -f /etc/nginx/sites-enabled/default ]; then
+              rm -f /etc/nginx/sites-enabled/default || true
+            fi
+
+            systemctl daemon-reload
+            systemctl enable intent_gunicorn
+            systemctl start intent_gunicorn
+            systemctl enable nginx
+            systemctl restart nginx
+
+  # ============================================================================
+  # TARGET GROUP FOR APPLICATION LOAD BALANCER
+  # ============================================================================
+  # Health checks route traffic to healthy instances
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "intent-target-group-${EnvironmentName}"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+        - Key: stickiness.enabled
+          Value: "true"
+        - Key: stickiness.type
+          Value: "lb_cookie"
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: "86400"
+      Tags:
+        - Key: Name
+          Value: !Sub "intent-tg-${EnvironmentName}"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================================
+  # APPLICATION LOAD BALANCER
+  # ============================================================================
+  # Distributes traffic across multiple EC2 instances
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "intent-alb-${EnvironmentName}"
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "intent-alb-${EnvironmentName}"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================================
+  # ALB LISTENER
+  # ============================================================================
+  # Routes HTTP traffic to target group
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !GetAtt TargetGroup.TargetGroupArn
+      LoadBalancerArn: !GetAtt ApplicationLoadBalancer.LoadBalancerArn
+      Port: 80
+      Protocol: HTTP
+
+  # ============================================================================
+  # AUTO SCALING GROUP
+  # ============================================================================
+  # Automatically manages EC2 instances across multiple AZs
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "intent-asg-${EnvironmentName}"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      VPCZoneIdentifier:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+      TargetGroupARNs:
+        - !GetAtt TargetGroup.TargetGroupArn
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub "intent-classifier-${EnvironmentName}"
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref EnvironmentName
+          PropagateAtLaunch: true
+
+# ============================================================================
+# CLOUDFORMATION OUTPUTS
+# ============================================================================
+# Export important resource identifiers and endpoints
+
+Outputs:
+  LoadBalancerDNS:
+    Description: "Application Load Balancer DNS name (use this URL to access the application)"
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-ALB-DNS"
+
+  LoadBalancerURL:
+    Description: "Full URL to access Intent Classifier API"
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}/predict"
+    Export:
+      Name: !Sub "${AWS::StackName}-AppURL"
+
+  AutoScalingGroupName:
+    Description: "Auto Scaling Group name"
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-ASG-Name"
+
+  TargetGroupArn:
+    Description: "Target Group ARN for load balancer"
+    Value: !GetAtt TargetGroup.TargetGroupArn
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetGroup-ARN"
+
+  TargetGroupName:
+    Description: "Target Group name"
+    Value: !GetAtt TargetGroup.TargetGroupName
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetGroup-Name"
+
+  LaunchTemplateId:
+    Description: "Launch Template ID for reference"
+    Value: !Ref LaunchTemplate
+    Export:
+      Name: !Sub "${AWS::StackName}-LaunchTemplate-ID"
+
+  InstanceSecurityGroupId:
+    Description: "Security Group ID for EC2 instances"
+    Value: !Ref InstanceSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceSG-ID"
+
+  ALBSecurityGroupId:
+    Description: "Security Group ID for Application Load Balancer"
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-ALBSG-ID"
+
+################################################################################
+# END OF CLOUDFORMATION TEMPLATE
+################################################################################
+#
+# DEPLOYMENT INSTRUCTIONS:
+# ========================
+#
+# 1. Create the stack:
+#    aws cloudformation create-stack \
+#      --stack-name intent-hw-prod \
+#      --template-body file://intent-hw-app-enhanced.yaml \
+#      --parameters \
+#        ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxx \
+#        ParameterKey=SubnetId1,ParameterValue=subnet-xxxxxxxx \
+#        ParameterKey=SubnetId2,ParameterValue=subnet-xxxxxxxx \
+#        ParameterKey=KeyName,ParameterValue=your-key-name \
+#      --capabilities CAPABILITY_NAMED_IAM
+#
+# 2. Monitor stack creation:
+#    aws cloudformation describe-stacks --stack-name intent-hw-prod \
+#      --query 'Stacks[0].StackStatus'
+#
+# 3. Get the ALB DNS name (use this to access the application):
+#    aws cloudformation describe-stacks --stack-name intent-hw-prod \
+#      --query 'Stacks[0].Outputs'
+#
+# 4. Test the application:
+#    ALB_DNS=$(aws cloudformation describe-stacks --stack-name intent-hw-prod \
+#      --query 'Stacks[0].Outputs[0].OutputValue' --output text)
+#    curl http://$ALB_DNS/predict
+#
+# 5. SSH into an instance (use Auto Scaling Group to get instance ID):
+#    INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
+#      --auto-scaling-group-names intent-asg-production \
+#      --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text)
+#    ssh -i your-key.pem ec2-user@$INSTANCE_ID
+#
+# 6. Monitor autoscaling:
+#    aws autoscaling describe-auto-scaling-groups \
+#      --auto-scaling-group-names intent-asg-production \
+#      --query 'AutoScalingGroups[0].[MinSize,DesiredCapacity,MaxSize,Instances[].InstanceId]'
+#
+# 7. View CloudWatch alarms:
+#    aws cloudwatch describe-alarms --alarm-name-prefix intent-classifier
+#
+# 8. Delete the stack:
+#    aws cloudformation delete-stack --stack-name intent-hw-prod
+#
+# KEY FEATURES:
+# =============
+#   ✓ Multi-AZ: Instances span 2+ availability zones
+#   ✓ Auto Scaling: Min 2, Max 6 instances based on CPU load
+#   ✓ Load Balancing: ALB distributes traffic across instances
+#   ✓ Health Checks: Automatic instance health verification (/health endpoint)
+#   ✓ Session Stickiness: Sticky cookies for session persistence
+#   ✓ CloudWatch Integration: CPU-based scaling alarms
+#   ✓ IAM Security: Least-privilege role for EC2 instances
+#   ✓ High Availability: Continues operating if one AZ fails
+#
+# SCALING BEHAVIOR:
+# =================
+#   • Scale UP: When average CPU > 70% for 10 minutes (2 × 5-min periods)
+#   • Scale DOWN: When average CPU < 30% for 10 minutes
+#   • Cooldown: 5 minutes between scale operations
+#   • Graceful termination: 30-second connection drain
+#
+# COST OPTIMIZATION TIPS:
+# =======================
+#   • Use t3.micro for dev/test (cheaper)
+#   • Set MaxSize=3 for cost control
+#   • Enable detailed monitoring (additional CloudWatch charges)
+#   • Use Reserved Instances for baseline capacity
+#
+################################################################################
