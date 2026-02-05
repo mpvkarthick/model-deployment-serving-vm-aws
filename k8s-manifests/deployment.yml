@@ -17,6 +17,6 @@ spec:
     spec:
       containers:
         - name: intent-classifier
-          image: mannepk85/intent-classifer-model:v1
+          image: mannepk85/intent-classifer-model:v5
           ports:
             - containerPort: 6000
